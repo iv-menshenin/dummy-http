@@ -21,6 +21,7 @@ func main(){
 	var handler httpHandler
 	addr = flag.String("addr", "localhost:8080", "Specify host/port for listening")
 	hello = flag.String("hello", "Hello world!", "Specify the response data")
+	flag.Parse()
 	println(fmt.Sprintf("Listen at %s. Returning data: %s", *addr, *hello))
 	http.ListenAndServe(*addr, &handler)
 }
