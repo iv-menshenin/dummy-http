@@ -15,6 +15,8 @@ import (
 	"bytes"
 	"errors"
 	"time"
+	"runtime"
+	"path/filepath"
 )
 
 type(
@@ -81,7 +83,16 @@ func main(){
 				defer func(){
 					e := recover()
 					if e != nil {
-						println(fmt.Sprintf("<%T>: %s", e, e))
+						println(fmt.Sprintf("<%T>: %s\n%s\nCALLSTACK:", e, e, trailLine))
+						for nn := 1; nn < 10; nn ++ {
+							fncPtr, file, line, ok := runtime.Caller(nn)
+							if ok {
+								filePath, fileName := filepath.Split(file)
+								lastDirectory := filepath.Base(filePath)
+								functionName := runtime.FuncForPC(fncPtr).Name()
+								println(fmt.Sprintf("%s [%d] %s/%s", functionName, line, lastDirectory, fileName))
+							}
+						}
 					}
 				}()
 				return handler.initSocketReaderAndProcessRequests()
@@ -243,31 +254,35 @@ func readFromNetwork(contentLen int64, reader *bufio.Reader, bufResp *bytes.Buff
 
 // Processing request. if there is a destination address, a new request is made for it.
 // Otherwise, a dummy response is given.
-func getAndProcessRequestFromNetwork(dataLen int64, transport *customHTTPTransport) (result *http.Response, err error){
+func getAndProcessRequestFromNetwork(dataLen int64, transport *customHTTPTransport) (request *http.Request, response *http.Response, err error){
 	var buf bytes.Buffer
 	if err := readFromNetwork(dataLen, transport.reader, &buf); err != nil {
 		panic(err)
 	}
-	request, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(buf.Bytes())))
+	request, err = http.ReadRequest(bufio.NewReader(bytes.NewReader(buf.Bytes())))
 	if err != nil {
-		return nil, err
+		return
 	}
 	if handlerURL != nil {
 		request.URL = handlerURL
 		request.URL.Path = request.RequestURI
 		request.RequestURI = ""
-		result, err = http.DefaultClient.Do(request)
-		result.Header.Set("X-Request-Status", "HELLO")
-		result.Header.Set("X-Request-Origin", request.URL.String())
+		requestURI := request.URL.String()
+		response, err = http.DefaultClient.Do(request)
+		if err != nil {
+			return
+		}
+		response.Header.Set("X-Request-Status", "HELLO")
+		response.Header.Set("X-Request-Origin", requestURI)
 	} else {
-		result = new(http.Response)
-		result.Body = ioutil.NopCloser(bytes.NewReader([]byte(*hello)))
-		result.StatusCode = 200
-		result.Status = "200 OK"
-		result.Proto = "HTTP/1.0"
-		result.Request = request
-		result.ContentLength = int64(len([]byte(*hello)))
-		result.Header = map[string][]string{
+		response = new(http.Response)
+		response.Body = ioutil.NopCloser(bytes.NewReader([]byte(*hello)))
+		response.StatusCode = 200
+		response.Status = "200 OK"
+		response.Proto = "HTTP/1.0"
+		response.Request = request
+		response.ContentLength = int64(len([]byte(*hello)))
+		response.Header = map[string][]string{
 			"X-Request-Status": {"HELLO"},
 			"X-Request-Origin": {"DUMMY"},
 		}
@@ -280,10 +295,16 @@ func getAndProcessRemoteRequest(transport customHTTPTransport) {
 	var responseData bytes.Buffer
 	transport.ReceiveCommand("READY", "READY")
 	_, dataLen := transport.ReceiveCommand("RECEIVE", "YES")
-	response, err := getAndProcessRequestFromNetwork(dataLen, &transport)
+	request, response, err := getAndProcessRequestFromNetwork(dataLen, &transport)
 	if err != nil {
 		println(fmt.Sprintf("<%T>: %s", err, err))
-		responseData.Write([]byte(fmt.Sprintf("%s %d %s\r\n\r\n", response.Proto, 500, http.StatusText(500))))
+		var proto string
+		if request != nil {
+			proto = request.Proto
+		} else {
+			proto = "HTTP/1.0"
+		}
+		responseData.Write([]byte(fmt.Sprintf("%s %d %s\r\n\r\n", proto, 500, http.StatusText(500))))
 		responseData.Write([]byte(fmt.Sprintf("<%T>: %s", err, err)))
 	} else {
 		println(fmt.Sprintf("Request status: %s", response.Status))
@@ -415,13 +436,13 @@ func (s *httpHandler) RepeatToSocket(r *http.Request, body []byte) (oStatus int,
 		go func(idx int, reqCopy *http.Request, reqBody []byte){
 			defer w.Done()
 			// this is where we check if the connection still alive
-			if s.repeatTo[i] == nil {
+			if s.repeatTo[idx] == nil {
 				return
 			}
 			client := http.Client{
 				// this is necessary so that our request goes to a sub socket
 				Transport: &customHTTPTransport{
-					connection: s.repeatTo[i],
+					connection: s.repeatTo[idx],
 					reader: bufio.NewReader(s.repeatTo[i]),
 					body: reqBody,
 				},
