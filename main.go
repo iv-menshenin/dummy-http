@@ -144,6 +144,9 @@ func (s *httpHandler) initRepeaterService(onDone func()){
 					s.repeatTo = append(s.repeatTo, conn)
 				}()
 			case <-s.stopper: return
+			case <-time.After(time.Second * 10):
+				println("ping...")
+				s.pingAll()
 			}
 		}
 	}(s.listener)
@@ -199,9 +202,20 @@ func (t *customHTTPTransport) SendCommand(cmd, expect string) (response string, 
 
 // Implements receiving and parsing a single command from a socket, as well as checking the correctness of data exchange
 func (t *customHTTPTransport) ReceiveCommand(expect, response string) (cmd string, attribute int64) {
-	request, err := t.reader.ReadString('?')
-	if err != nil {
-		panic(err)
+	var(
+		request string
+		err error
+	)
+	for{
+		request, err = t.reader.ReadString('?')
+		if err != nil {
+			panic(err)
+		}
+		if request == "PING?" {
+			_, err = t.connection.Write([]byte("OK!"))
+			continue
+		}
+		break
 	}
 	println("<<< " + request)
 	request = strings.TrimSpace(request)
@@ -410,9 +424,42 @@ func (t *customHTTPTransport) RoundTrip(r *http.Request) (resp *http.Response, e
 	return http.ReadResponse(bufio.NewReader(bytes.NewReader(httpResponseRawData.Bytes())), r)
 }
 
+func (s *httpHandler) pingAll() {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	var w sync.WaitGroup
+	w.Add(len(s.repeatTo))
+	for i := range s.repeatTo {
+		go func(idx int){
+			defer func(){
+				if recover() != nil {
+					s.repeatTo[idx] = nil
+				}
+				w.Done()
+			}()
+			if s.repeatTo[idx] == nil {
+				return
+			}
+			var test = []byte{0, 0, 0}
+			_, err := s.repeatTo[idx].Write([]byte("PING?"))
+			if err != nil {
+				panic(err)
+			}
+			_, err = s.repeatTo[idx].Read(test)
+			if err != nil {
+				panic(err)
+			}
+			if string(test) != "OK!" {
+				panic("brokes")
+			}
+		}(i)
+	}
+	w.Wait()
+}
+
 // The request will be repeated for all connections, all responses will be collected and analyzed.
 // One result will be selected as the resulting answer.
-func (s *httpHandler) RepeatToSocket(r *http.Request, body []byte) (oStatus int, oHeader http.Header, oBody []byte){
+func (s *httpHandler) repeatToSocket(r *http.Request, body []byte) (oStatus int, oHeader http.Header, oBody []byte){
 	s.mux.Lock()
 	defer s.mux.Unlock()
 	type(
@@ -521,7 +568,7 @@ func (s *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request){
 	if *repeat != "" {
 		// Repeat request for all connected sockets
 		println(fmt.Sprintf("%s\nRESPONSE:\n%s\n%s", trailLine, *hello, trailLine))
-		status, headers, body := s.RepeatToSocket(r, bodyBytes)
+		status, headers, body := s.repeatToSocket(r, bodyBytes)
 		if status == 0 {
 			// This is done if errors come from all the sockets.
 			w.WriteHeader(http.StatusOK)
