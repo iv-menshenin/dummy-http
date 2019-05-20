@@ -145,7 +145,6 @@ func (s *httpHandler) initRepeaterService(onDone func()){
 				}()
 			case <-s.stopper: return
 			case <-time.After(time.Second * 10):
-				println("ping...")
 				s.pingAll()
 			}
 		}
