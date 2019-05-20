@@ -24,46 +24,53 @@ type(
 		mux sync.Mutex
 		stopper chan interface{}
 		listener net.Listener
+		haveRepeater bool
 		repeatTo []net.Conn
+		helloStr string
 	}
 )
 
 var(
-	addr      *string
-	hello     *string
-	repeat    *string
-	repeater  *string
-	sendTo    *string
 	trailLine  = strings.Repeat("-", 80)
 	extraLine  = strings.Repeat("*", 80)
 )
 
 func main(){
-	var handler httpHandler
-	var w sync.WaitGroup
-	handler.stopper = make(chan interface{})
-
+	var(
+		addr      *string
+		hello     *string
+		repeat    *string
+		repeater  *string
+		sendTo    *string
+	)
 	addr = flag.String("addr", "", "Specify address for listening (host:port format)")
 	hello = flag.String("hello", "Hello world!", "Specify the response data string")
 	repeat = flag.String("repeat", "", "Create a repeater socket and send all requests to it (IP:port format)")
 	repeater = flag.String("repeater", "", "Get requests from socket and sent it forward (host:port format)")
 	sendTo = flag.String("send_to", "", "Where to send message (must be whole URL e.g. http://localhost:8800)")
 	flag.Parse()
-
-	if *repeat != "" {
-		w.Add(1)
-		handler.initRepeaterService(func(){
-			w.Done()
-		})
-	}
 	if *repeater != "" && *addr != "" {
 		panic(errors.New("you cannot specify both addr and repeater, because these are source"))
+	}
+	if *repeater != "" && *repeat != "" {
+		panic(errors.New("you cannot specify both repeat and repeater"))
 	}
 	if *repeater == "" && *addr == "" {
 		flag.PrintDefaults()
 		return
 	}
+	var handler httpHandler
+	var w sync.WaitGroup
 	if *repeater == "" {
+		handler.stopper = make(chan interface{})
+		handler.helloStr = *hello
+		if *repeat != "" {
+			w.Add(1)
+			handler.haveRepeater = true
+			handler.initRepeaterService(*repeat, func(){
+				w.Done()
+			})
+		}
 		println(fmt.Sprintf("Listen at %s. Returning data: %s", *addr, *hello))
 		err := http.ListenAndServe(*addr, &handler)
 		if err != nil {
@@ -95,7 +102,7 @@ func main(){
 						}
 					}
 				}()
-				return handler.initSocketReaderAndProcessRequests(handlerURL)
+				return handler.initSocketReaderAndProcessRequests(handlerURL, *repeater, *hello)
 			}() {
 				close(handler.stopper)
 				break
@@ -107,11 +114,11 @@ func main(){
 
 // Starting listener for Socket-Repeater. Is a service for transmitting a HTTP request to another host. Async.
 // All routines stop with a single signal: close(httpHandler.stopper)
-func (s *httpHandler) initRepeaterService(onDone func()){
-	println(fmt.Sprintf("Start listener on: %s (Socket-Repeater)", *repeat))
+func (s *httpHandler) initRepeaterService(repeat string, onDone func()){
+	println(fmt.Sprintf("Start listener on: %s (Socket-Repeater)", repeat))
 	var err error
 	var ch = make(chan net.Conn)
-	if s.listener, err = net.Listen("tcp", *repeat); err != nil {
+	if s.listener, err = net.Listen("tcp", repeat); err != nil {
 		panic(err)
 	}
 	// This function will be the second to complete therefore, onDone is performed
@@ -268,7 +275,7 @@ func readFromNetwork(contentLen int64, reader *bufio.Reader, bufResp *bytes.Buff
 
 // Processing request. if there is a destination address, a new request is made for it.
 // Otherwise, a dummy response is given.
-func getAndProcessRequestFromNetwork(dataLen int64, transport *customHTTPTransport) (request *http.Request, response *http.Response, err error){
+func getAndProcessRequestFromNetwork(dataLen int64, transport *customHTTPTransport, helloStr string) (request *http.Request, response *http.Response, err error){
 	var buf bytes.Buffer
 	if err := readFromNetwork(dataLen, transport.reader, &buf); err != nil {
 		panic(err)
@@ -293,12 +300,12 @@ func getAndProcessRequestFromNetwork(dataLen int64, transport *customHTTPTranspo
 		response.Header.Set("X-Request-Origin", requestURI)
 	} else {
 		response = new(http.Response)
-		response.Body = ioutil.NopCloser(bytes.NewReader([]byte(*hello)))
+		response.Body = ioutil.NopCloser(bytes.NewReader([]byte(helloStr)))
 		response.StatusCode = 200
 		response.Status = "200 OK"
 		response.Proto = "HTTP/1.0"
 		response.Request = request
-		response.ContentLength = int64(len([]byte(*hello)))
+		response.ContentLength = int64(len([]byte(helloStr)))
 		response.Header = map[string][]string{
 			"X-Request-Status": {"HELLO"},
 			"X-Request-Origin": {"DUMMY"},
@@ -308,11 +315,11 @@ func getAndProcessRequestFromNetwork(dataLen int64, transport *customHTTPTranspo
 }
 
 // Receives one request from the service socket and executes it, giving the result back to the socket
-func getAndProcessRemoteRequest(transport customHTTPTransport) {
+func getAndProcessRemoteRequest(transport customHTTPTransport, helloStr string) {
 	var responseData bytes.Buffer
 	transport.ReceiveCommand("READY", "READY")
 	_, dataLen := transport.ReceiveCommand("RECEIVE", "YES")
-	request, response, err := getAndProcessRequestFromNetwork(dataLen, &transport)
+	request, response, err := getAndProcessRequestFromNetwork(dataLen, &transport, helloStr)
 	if err != nil {
 		println(fmt.Sprintf("<%T>: %s", err, err))
 		var proto string
@@ -350,8 +357,8 @@ func getAndProcessRemoteRequest(transport customHTTPTransport) {
 }
 
 // Create a connection to the service socket-repeater for receiving HTTP-requests from it.
-func (s *httpHandler) initSocketReaderAndProcessRequests(handlerURL *url.URL) (breakProcess bool) {
-	conn, err := net.Dial("tcp", *repeater)
+func (s *httpHandler) initSocketReaderAndProcessRequests(handlerURL *url.URL, repeater, helloStr string) (breakProcess bool) {
+	conn, err := net.Dial("tcp", repeater)
 	if err != nil {
 		println(fmt.Sprintf("Critical error when connecting attempt: <%T>: %s", err, err))
 		return true
@@ -362,7 +369,7 @@ func (s *httpHandler) initSocketReaderAndProcessRequests(handlerURL *url.URL) (b
 		reader: bufio.NewReader(conn),
 	}
 	for {
-		getAndProcessRemoteRequest(transport)
+		getAndProcessRemoteRequest(transport, helloStr)
 	}
 }
 
@@ -569,9 +576,9 @@ func (s *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request){
 		println("BODY:")
 		println(string(bodyBytes))
 	}
-	if *repeat != "" {
+	if s.haveRepeater {
 		// Repeat request for all connected sockets
-		println(fmt.Sprintf("%s\nRESPONSE:\n%s\n%s", trailLine, *hello, trailLine))
+		println(fmt.Sprintf("%s\nRESPONSE:\n%s\n%s", trailLine, s.helloStr, trailLine))
 		status, headers, body := s.repeatToSocket(r, bodyBytes)
 		if status == 0 {
 			// This is done if errors come from all the sockets.
@@ -579,7 +586,7 @@ func (s *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request){
 			if body != nil && len(body) > 0 {
 				w.Write(body)
 			} else {
-				w.Write([]byte(*hello))
+				w.Write([]byte(s.helloStr))
 			}
 			return
 		}
@@ -595,8 +602,8 @@ func (s *httpHandler) ServeHTTP(w http.ResponseWriter, r *http.Request){
 		}
 	} else {
 		// This answer is a dummy
-		println(fmt.Sprintf("%s\nRESPONSE:\n%s\n%s", trailLine, *hello, trailLine))
+		println(fmt.Sprintf("%s\nRESPONSE:\n%s\n%s", trailLine, s.helloStr, trailLine))
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(*hello))
+		w.Write([]byte(s.helloStr))
 	}
 }
