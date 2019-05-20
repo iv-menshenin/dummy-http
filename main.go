@@ -36,7 +36,6 @@ var(
 	sendTo    *string
 	trailLine  = strings.Repeat("-", 80)
 	extraLine  = strings.Repeat("*", 80)
-	handlerURL *url.URL
 )
 
 func main(){
@@ -71,6 +70,7 @@ func main(){
 			panic(err)
 		}
 	} else {
+		var handlerURL *url.URL
 		if *sendTo != "" {
 			var err error
 			handlerURL, err = url.Parse(*sendTo)
@@ -95,7 +95,7 @@ func main(){
 						}
 					}
 				}()
-				return handler.initSocketReaderAndProcessRequests()
+				return handler.initSocketReaderAndProcessRequests(handlerURL)
 			}() {
 				close(handler.stopper)
 				break
@@ -164,9 +164,10 @@ func (s *httpHandler) initRepeaterService(onDone func()){
 //     MM - number of bytes of response
 type(
 	customHTTPTransport struct{
-		connection net.Conn		// socket connection
-		reader *bufio.Reader	// same socket but just reader interface
-		body []byte				// the copy of the original request body
+		handlerURL *url.URL         // address of the server that will process the request
+		connection net.Conn         // socket connection
+		reader     *bufio.Reader    // same socket but just reader interface
+		body       []byte           // the copy of the original request body
 	}
 )
 
@@ -272,12 +273,15 @@ func getAndProcessRequestFromNetwork(dataLen int64, transport *customHTTPTranspo
 	if err := readFromNetwork(dataLen, transport.reader, &buf); err != nil {
 		panic(err)
 	}
+	println(extraLine)
+	println(string(buf.Bytes()))
+	println(extraLine)
 	request, err = http.ReadRequest(bufio.NewReader(bytes.NewReader(buf.Bytes())))
 	if err != nil {
 		return
 	}
-	if handlerURL != nil {
-		request.URL = handlerURL
+	if transport.handlerURL != nil {
+		request.URL = transport.handlerURL
 		request.URL.Path = request.RequestURI
 		request.RequestURI = ""
 		requestURI := request.URL.String()
@@ -346,13 +350,14 @@ func getAndProcessRemoteRequest(transport customHTTPTransport) {
 }
 
 // Create a connection to the service socket-repeater for receiving HTTP-requests from it.
-func (s *httpHandler) initSocketReaderAndProcessRequests() (breakProcess bool) {
+func (s *httpHandler) initSocketReaderAndProcessRequests(handlerURL *url.URL) (breakProcess bool) {
 	conn, err := net.Dial("tcp", *repeater)
 	if err != nil {
 		println(fmt.Sprintf("Critical error when connecting attempt: <%T>: %s", err, err))
 		return true
 	}
 	transport := customHTTPTransport{
+		handlerURL: handlerURL,
 		connection: conn,
 		reader: bufio.NewReader(conn),
 	}
@@ -449,7 +454,7 @@ func (s *httpHandler) pingAll() {
 				panic(err)
 			}
 			if string(test) != "OK!" {
-				panic("brokes")
+				panic("broken")
 			}
 		}(i)
 	}
