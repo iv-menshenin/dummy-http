@@ -40,6 +40,8 @@ var(
 	extraLine  = strings.Repeat("*", 80)
 )
 
+const intro = "The dummy listener for HTTP ports allows you to forward requests to remote servers or local stations using socket-repeaters. It works in two modes:\n    1. Read and repeat.\n    2. Receiving and processing a request"
+
 func main(){
 	var(
 		addr      *string
@@ -48,11 +50,17 @@ func main(){
 		repeater  *string
 		sendTo    *string
 	)
-	addr = flag.String("addr", "", "Specify address for listening (host:port format)")
-	hello = flag.String("hello", "Hello world!", "Specify the response data string")
-	repeat = flag.String("repeat", "", "Create a repeater socket and send all requests to it (IP:port format)")
-	repeater = flag.String("repeater", "", "Get requests from socket and sent it forward (host:port format)")
-	sendTo = flag.String("send_to", "", "Where to send message (must be whole URL e.g. http://localhost:8800)")
+	flag.Usage = func(){
+		fmt.Fprintf(flag.CommandLine.Output(), "%s\n%s\n%s", trailLine, intro, trailLine)
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+		os.Exit(0)
+	}
+	addr = flag.String("addr", "", "Specify address (host:port) for listening. Turns on mode 1")
+	hello = flag.String("hello", "Hello world!", "Specify the default response data string")
+	repeat = flag.String("repeat", "", "Specify the bind address (IP:port) to create a socket-repeater. For mode 1 only")
+	repeater = flag.String("repeater", "", "Specify the address (host:port) of the remote socket repeater to receive requests from him. Turns on 2")
+	sendTo = flag.String("send_to", "", "Specify the URL of the HTTP server (eg. http://localhost:8800) that will process the requests and give the final result.")
 	flag.Parse()
 	if *repeater != "" && *addr != "" {
 		panic(errors.New("you cannot specify both addr and repeater, because these are source"))
@@ -61,7 +69,7 @@ func main(){
 		panic(errors.New("you cannot specify both repeat and repeater"))
 	}
 	if *repeater == "" && *addr == "" {
-		flag.PrintDefaults()
+		flag.Usage()
 		return
 	}
 	var handler httpHandler
