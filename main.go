@@ -17,15 +17,20 @@ import (
 	"time"
 	"runtime"
 	"path/filepath"
+	"os"
 )
 
 type(
+	httpRepeaterSocket struct {
+		mux sync.Mutex
+		connection net.Conn
+	}
 	httpHandler struct {
 		mux sync.Mutex
 		stopper chan interface{}
 		listener net.Listener
 		haveRepeater bool
-		repeatTo []net.Conn
+		repeatTo []httpRepeaterSocket
 		helloStr string
 	}
 )
@@ -148,7 +153,7 @@ func (s *httpHandler) initRepeaterService(repeat string, onDone func()){
 				func(){
 					s.mux.Lock()
 					defer s.mux.Unlock()
-					s.repeatTo = append(s.repeatTo, conn)
+					s.repeatTo = append(s.repeatTo, httpRepeaterSocket{connection: conn})
 				}()
 			case <-s.stopper: return
 			case <-time.After(time.Second * 10):
@@ -175,11 +180,13 @@ type(
 		connection net.Conn         // socket connection
 		reader     *bufio.Reader    // same socket but just reader interface
 		body       []byte           // the copy of the original request body
+		idx        int              // index of net.Conn element
+		mux        *sync.Mutex
 	}
 )
 
 // implements the transfer of a single command to the socket, as well as parsing and checking the correctness of the answer
-func (t *customHTTPTransport) SendCommand(cmd, expect string) (response string, attribute int64) {
+func (t *customHTTPTransport) sendCommand(cmd, expect string) (response string, attribute int64) {
 	println(">>> " + cmd)
 	_, err := t.connection.Write([]byte(cmd + "?"))
 	if err != nil {
@@ -208,7 +215,7 @@ func (t *customHTTPTransport) SendCommand(cmd, expect string) (response string, 
 }
 
 // Implements receiving and parsing a single command from a socket, as well as checking the correctness of data exchange
-func (t *customHTTPTransport) ReceiveCommand(expect, response string) (cmd string, attribute int64) {
+func (t *customHTTPTransport) receiveCommand(expect, response string) (cmd string, attribute int64) {
 	var(
 		request string
 		err error
@@ -317,8 +324,8 @@ func getAndProcessRequestFromNetwork(dataLen int64, transport *customHTTPTranspo
 // Receives one request from the service socket and executes it, giving the result back to the socket
 func getAndProcessRemoteRequest(transport customHTTPTransport, helloStr string) {
 	var responseData bytes.Buffer
-	transport.ReceiveCommand("READY", "READY")
-	_, dataLen := transport.ReceiveCommand("RECEIVE", "YES")
+	transport.receiveCommand("READY", "READY")
+	_, dataLen := transport.receiveCommand("RECEIVE", "YES")
 	request, response, err := getAndProcessRequestFromNetwork(dataLen, &transport, helloStr)
 	if err != nil {
 		println(fmt.Sprintf("<%T>: %s", err, err))
@@ -345,7 +352,7 @@ func getAndProcessRemoteRequest(transport customHTTPTransport, helloStr string) 
 			responseData.Write([]byte("\r\n"))
 		}
 	}
-	transport.ReceiveCommand("RETRIEVE", fmt.Sprintf("CATCH %d", responseData.Len()))
+	transport.receiveCommand("RETRIEVE", fmt.Sprintf("CATCH %d", responseData.Len()))
 	_, err = transport.connection.Write(responseData.Bytes())
 	println(extraLine)
 	println(string(responseData.Bytes()))
@@ -353,7 +360,7 @@ func getAndProcessRemoteRequest(transport customHTTPTransport, helloStr string) 
 	if err != nil {
 		panic(err)
 	}
-	transport.ReceiveCommand("BYE", "BYE")
+	transport.receiveCommand("BYE", "BYE")
 }
 
 // Create a connection to the service socket-repeater for receiving HTTP-requests from it.
@@ -407,15 +414,15 @@ func (t *customHTTPTransport) RoundTrip(r *http.Request) (resp *http.Response, e
 		httpRequestRawData.Write([]byte("\r\n"))
 	}
 
-	t.SendCommand("READY", "READY")
-	t.SendCommand(fmt.Sprintf("RECEIVE %d", httpRequestRawData.Len()), "YES")
+	t.sendCommand("READY", "READY")
+	t.sendCommand(fmt.Sprintf("RECEIVE %d", httpRequestRawData.Len()), "YES")
 
 	_, err = httpRequestRawData.WriteTo(t.connection)
 	if err != nil {
 		return nil, err
 	}
 	var httpResponseRawData bytes.Buffer
-	_, contentLen := t.SendCommand("RETRIEVE", "CATCH")
+	_, contentLen := t.sendCommand("RETRIEVE", "CATCH")
 	if contentLen < 1 {
 		return nil, errors.New(fmt.Sprintf("unexpected content length: %d", contentLen))
 	} else {
@@ -430,49 +437,109 @@ func (t *customHTTPTransport) RoundTrip(r *http.Request) (resp *http.Response, e
 		return nil, errors.New(fmt.Sprintf("unexpected received data length: %d", httpResponseRawData.Len()))
 	}
 	println("total size:", httpResponseRawData.Len())
-	t.SendCommand("BYE", "BYE")
+	t.sendCommand("BYE", "BYE")
 
 	return http.ReadResponse(bufio.NewReader(bytes.NewReader(httpResponseRawData.Bytes())), r)
 }
 
+// Implements pinging for all unused connections. Removes link to connection if it is broken.
 func (s *httpHandler) pingAll() {
-	s.mux.Lock()
-	defer s.mux.Unlock()
+	// links to connections are obtained under the server mutex
+	repeaters := func() []*httpRepeaterSocket {
+		s.mux.Lock()
+		defer s.mux.Unlock()
+		result := make([]*httpRepeaterSocket, 0, len(s.repeatTo))
+		for i := range s.repeatTo {
+			if s.repeatTo[i].connection != nil {
+				result = append(result, &s.repeatTo[i])
+			}
+		}
+		return result
+	}()
+
 	var w sync.WaitGroup
-	w.Add(len(s.repeatTo))
-	for i := range s.repeatTo {
-		go func(idx int){
+	w.Add(len(repeaters))
+	for i := range repeaters {
+		go func(repeater *httpRepeaterSocket){
+			defer w.Done()
+			repeater.mux.Lock()
+			defer repeater.mux.Unlock()
 			defer func(){
 				if recover() != nil {
-					s.repeatTo[idx] = nil
+					repeater.connection = nil
 				}
-				w.Done()
 			}()
-			if s.repeatTo[idx] == nil {
+			if repeater.connection == nil {
 				return
 			}
+			// as a ping message we send just a PING, and as a response we expect OK
+			// the remote socket can process this message correctly only when it is waiting for the "READY" command,
+			// that is, between two transactions
 			var test = []byte{0, 0, 0}
-			_, err := s.repeatTo[idx].Write([]byte("PING?"))
+			_, err := repeater.connection.Write([]byte("PING?"))
 			if err != nil {
 				panic(err)
 			}
-			_, err = s.repeatTo[idx].Read(test)
+			_, err = repeater.connection.Read(test)
 			if err != nil {
 				panic(err)
 			}
 			if string(test) != "OK!" {
 				panic("broken")
 			}
-		}(i)
+		}(repeaters[i])
 	}
 	w.Wait()
+}
+
+// Marking the connection as closed. We simply clear the link to the net.Conn
+func (s *httpHandler) markConnectionAsClosed(idx int) {
+	s.mux.Lock()
+	if !(len(s.repeatTo) > idx) {
+		s.mux.Unlock()
+		return
+	}
+	repeater := &s.repeatTo[idx]
+	s.mux.Unlock()
+	repeater.mux.Lock()
+	defer repeater.mux.Unlock()
+	if repeater.connection != nil {
+		if err := repeater.connection.Close(); err != nil {
+			println(fmt.Sprintf("<%T>: %s", err, err))
+		}
+		// Despite the fact that the array element is not deleted and this is officially a memory leak,
+		// I do not consider this critical
+		repeater.connection = nil
+	}
+}
+
+// Build an http.Client array from a socket-repeaters array. Running under server mutex
+func (s *httpHandler) getCustomHTTPClients(reqBody []byte) []http.Client {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	var clients = make([]http.Client, 0, len(s.repeatTo))
+	for i := range s.repeatTo {
+		if s.repeatTo[i].connection != nil {
+			clients = append(
+				clients,
+				http.Client{
+					Transport: &customHTTPTransport{
+						mux: &s.repeatTo[i].mux,
+						connection: s.repeatTo[i].connection,
+						reader: bufio.NewReader(s.repeatTo[i].connection),
+						body: reqBody,
+						idx: i,
+					},
+				},
+			)
+		}
+	}
+	return clients
 }
 
 // The request will be repeated for all connections, all responses will be collected and analyzed.
 // One result will be selected as the resulting answer.
 func (s *httpHandler) repeatToSocket(r *http.Request, body []byte) (oStatus int, oHeader http.Header, oBody []byte){
-	s.mux.Lock()
-	defer s.mux.Unlock()
 	type(
 		responseElem struct{
 			response *http.Response
@@ -483,35 +550,26 @@ func (s *httpHandler) repeatToSocket(r *http.Request, body []byte) (oStatus int,
 	var(
 		w sync.WaitGroup
 		ch = make(chan responseElem, len(s.repeatTo))
+		httpClients = s.getCustomHTTPClients(body)
 	)
 	r.RequestURI = ""
-	w.Add(len(s.repeatTo))
-	for i := range s.repeatTo {
+	w.Add(len(httpClients))
+	for _, client := range httpClients {
 		// Warning!
 		// Any of these connections can be closed at any time, so we must mark such connections as complete.
 		// For this purpose, we transmit error information to the channel and as soon as it is read, the link
 		// to the connection will be set to nil. Such compounds will no longer be used.
-		go func(idx int, reqCopy *http.Request, reqBody []byte){
+		go func(client http.Client, reqCopy *http.Request){
+			client.Transport.(*customHTTPTransport).mux.Lock()
+			defer client.Transport.(*customHTTPTransport).mux.Unlock()
 			defer w.Done()
-			// this is where we check if the connection still alive
-			if s.repeatTo[idx] == nil {
-				return
-			}
-			client := http.Client{
-				// this is necessary so that our request goes to a sub socket
-				Transport: &customHTTPTransport{
-					connection: s.repeatTo[idx],
-					reader: bufio.NewReader(s.repeatTo[i]),
-					body: reqBody,
-				},
-			}
 			respFromSocket, errFromSocket := client.Do(reqCopy)
 			ch <- responseElem{
 				response: respFromSocket,
 				err:      errFromSocket,
-				idx:      idx,
+				idx:      client.Transport.(*customHTTPTransport).idx,
 			}
-		}(i, r, body)
+		}(client, r)
 	}
 	// We have to wait until all the subroutines do their work, and then close the channel.
 	// This will signal the HTTP response cycle that the data will no longer arrive.
@@ -523,15 +581,7 @@ func (s *httpHandler) repeatToSocket(r *http.Request, body []byte) (oStatus int,
 		if response.err != nil {
 			// It should be with minimum priority, since here, first of all, those connections that have been closed.
 			// Closing connections is not an error
-			func(conn net.Conn){
-				err := conn.Close()
-				if err != nil {
-					println(fmt.Sprintf("<%T>: %s", err, err))
-				}
-			}(s.repeatTo[response.idx])
-			// Despite the fact that the array element is not deleted and this is officially a memory leak,
-			// I do not consider this critical
-			s.repeatTo[response.idx] = nil
+			s.markConnectionAsClosed(response.idx)
 			oBody = []byte(fmt.Sprintf("<%T>: %s", response.err, response.err))
 		} else
 		// the higher the response status, the higher the response priority
